@@ -43,7 +43,7 @@ This scripts connects to a local Ercoin node and live prints transaction values 
    if __name__ == '__main__':
        reactor = DummyReactor(
            node='127.0.0.1',
-           address=sys.argv[1],
+           to_address=sys.argv[1],
            ssl=False,
        )
        try:

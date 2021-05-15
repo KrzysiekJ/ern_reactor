@@ -12,6 +12,8 @@
 
 import asyncio
 import base64
+import functools
+import hashlib
 import json
 import logging
 import os
@@ -43,18 +45,18 @@ TransferTx = typing.TypedDict(
 )
 
 
-def b64_to_bytes(b64: str) -> bytes:
+def _b64_to_bytes(b64: str) -> bytes:
     return base64.decodebytes(b64.encode('ascii'))
 
 
-def b64_to_str(b64: str) -> str:
-    return b64_to_bytes(b64).decode('ascii')
+def _b64_to_str(b64: str) -> str:
+    return _b64_to_bytes(b64).decode('ascii')
 
 
 def _iter_event_attrs(attrs) -> typing.Iterator[typing.Tuple[str, typing.Optional[str]]]:
     for attr in attrs:
-        key = b64_to_str(attr['key'])
-        value = None if (maybe_value_b64 := attr['value']) is None else b64_to_str(maybe_value_b64)
+        key = _b64_to_str(attr['key'])
+        value = None if (maybe_value_b64 := attr['value']) is None else _b64_to_str(maybe_value_b64)
         yield key, value
 
 
@@ -66,7 +68,7 @@ def _events_to_dict(events):
             if key in {'type', 'value', 'height', 'fee', 'index'}:
                 value_prime = int(value)
             elif key in {'from', 'to', 'message'}:
-                value_prime = b64_to_bytes(value or '')
+                value_prime = _b64_to_bytes(value or '')
             else:
                 value_prime = value
             d[key] = value_prime
@@ -88,7 +90,7 @@ def _subscription_msg_to_tx(tx_msg) -> TransferTx:
 
 def _search_result_to_tx(search_result) -> TransferTx:
     tx = _events_to_dict(search_result['tx_result']['events'])
-    tx['raw'] = b64_to_bytes(search_result['tx'])
+    tx['raw'] = _b64_to_bytes(search_result['tx'])
     tx['index'] = search_result['index']
     tx['hash'] = search_result['hash']
     tx['height'] = int(search_result['height'])
@@ -157,6 +159,14 @@ class JSONRPCClient:
 Height = typing.NewType('Height', int)
 TxHash = typing.NewType('TxHash', str)
 Base64String = typing.NewType('Base64String', str)
+Address = typing.NewType('Address', typing.Union[Base64String, bytes])
+
+
+def _maybe_enforce_b64(maybe_address: typing.Optional[Address]) -> typing.Optional[Base64String]:
+    if isinstance(maybe_address, str):
+        return address
+    elif isinstance(maybe_address, bytes):
+        return base64.encodebytes(address).decode('ascii').strip()
 
 
 class ErcoinReactor:
@@ -166,15 +176,22 @@ class ErcoinReactor:
             self,
             *,
             node,
-            address: typing.Union[Base64String, bytes],
+            to_address: typing.Optional[Address]=None,
+            from_address: typing.Optional[Address]=None,
             ssl=True,
             port=26657,
     ):
+        """Initialize reactor.
+
+        to_address and from_address cannot be given simultaneously.
+        """
+
+        if to_address and from_address:
+            raise ValueError('At most one address can be given.')
+
         self._node = node
-        if isinstance(address, str):
-            self._address_b64 = address
-        else:
-            self._address_b64 = base64.encodebytes(address).decode('ascii').strip()
+        self._to_address_b64 = _maybe_enforce_b64(to_address)
+        self._from_address_b64 = _maybe_enforce_b64(from_address)
         self._port = port
         self._ssl = ssl
 
@@ -186,32 +203,59 @@ class ErcoinReactor:
         protocol = 'wss' if self._ssl else 'ws'
         return f'{protocol}://{self._node}:{self._port}/websocket'
 
+    @functools.cached_property
     def _subscription_query(self):
-        return f"tm.event='Tx' AND tx.to='{self._address_b64}'"
+        return self._join_queries([
+            "tm.event='Tx'",
+            self._base_tx_query,
+        ])
 
+    @functools.cached_property
+    def _catchup_query(self):
+        return self._join_queries([
+            self._base_tx_query,
+            f'tx.height >= {self._last_height}',
+        ])
+
+    @functools.cached_property
+    def _base_tx_query(self):
+        if self._to_address_b64:
+            return f"tx.to='{self._to_address_b64}'"
+        elif self._from_address_b64:
+            return f"tx.from='{self._from_address_b64}'"
+        return ''
+
+    @staticmethod
+    def _join_queries(queries):
+        return ' AND '.join(query for query in queries if query)
+
+    @functools.cached_property
     def _state_filepath(self):
+        h = hashlib.new('sha224')
+        h.update(self._base_tx_query.encode('ascii'))
+        basename = h.digest().hex()
+
         return os.path.join(
             get_local_data_dir(),
             'ern_reactor',
             self.get_namespace(),
-            f'{self._address_b64}.json',
+            f'{basename}.json',
         )
 
     def _load_state(self) -> typing.Optional[dict]:
-        state_filename = self._state_filepath()
+        state_filename = self._state_filepath
         if os.path.isfile(state_filename):
             with open(state_filename) as f:
                 return json.load(f)
 
     def _dump_state(self, state):
-        filepath = self._state_filepath()
-        tmp_filepath = filepath + '.tmp'
-        dirpath = os.path.dirname(filepath)
+        tmp_filepath = self._state_filepath + '.tmp'
+        dirpath = os.path.dirname(self._state_filepath)
         if not os.path.isdir(dirpath):
             os.makedirs(dirpath)
         with open(tmp_filepath, 'w') as f:
             json.dump(state, f)
-        os.replace(tmp_filepath, filepath)
+        os.replace(tmp_filepath, self._state_filepath)
 
     def _load_sync_status(self) -> None:
         if (state := self._load_state()) is None:
@@ -228,7 +272,6 @@ class ErcoinReactor:
         self._dump_state(state)
 
     async def _start_catchup(self):
-        self._catchup_query = f"tx.to='{self._address_b64}' AND tx.height >= {self._last_height}"
         self._last_catchup_page = 0
         return await self._continue_catchup()
 
@@ -245,7 +288,7 @@ class ErcoinReactor:
 
     async def _handle_connection(self, ws):
         self._rpc_client = JSONRPCClient(ws)
-        subscribe_id = await self._rpc_client.req('subscribe', {'query': self._subscription_query()})
+        subscribe_id = await self._rpc_client.req('subscribe', {'query': self._subscription_query})
         subscribe_resp = await self._rpc_client.recv()
         assert subscribe_resp.get('result') == {}
         catchup_id = await self._start_catchup()
