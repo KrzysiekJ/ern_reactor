@@ -164,9 +164,9 @@ Address = typing.NewType('Address', typing.Union[Base64String, bytes])
 
 def _maybe_enforce_b64(maybe_address: typing.Optional[Address]) -> typing.Optional[Base64String]:
     if isinstance(maybe_address, str):
-        return address
+        return maybe_address
     elif isinstance(maybe_address, bytes):
-        return base64.encodebytes(address).decode('ascii').strip()
+        return base64.encodebytes(maybe_address).decode("ascii").strip()
 
 
 class ErcoinReactor:
@@ -176,8 +176,8 @@ class ErcoinReactor:
             self,
             *,
             node,
-            to_address: typing.Optional[Address]=None,
-            from_address: typing.Optional[Address]=None,
+            to_address: typing.Optional[Address] = None,
+            from_address: typing.Optional[Address] = None,
             ssl=True,
             port=26657,
     ):

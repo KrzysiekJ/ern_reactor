@@ -6,7 +6,7 @@ with open('README.rst', 'r') as f:
 
 setup(
     name='ern_reactor',
-    version='0.2.0',
+    version='0.2.1',
     description='Do arbitrary things in reaction to Ercoin transfers',
     long_description=long_description,
     long_description_content_type='text/x-rst',
