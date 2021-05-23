@@ -12,6 +12,7 @@
 
 import asyncio
 import base64
+import datetime
 import functools
 import hashlib
 import json
@@ -21,7 +22,9 @@ import os.path
 import platform
 import threading
 import typing
+from urllib.request import urlopen
 
+import dateutil.parser
 import websockets
 
 logger = logging.getLogger(__name__)
@@ -41,6 +44,7 @@ TransferTx = typing.TypedDict(
         'fee': int,
         'raw': bytes,
         'index': int,
+        'block_time': datetime.datetime,
     },
 )
 
@@ -73,28 +77,6 @@ def _events_to_dict(events):
                 value_prime = value
             d[key] = value_prime
     return d
-
-
-def _subscription_msg_to_tx(tx_msg) -> TransferTx:
-    tx_result = tx_msg['result']['data']['value']['TxResult']
-    tx = _events_to_dict(tx_result['result']['events'])
-    tx['raw'] = base64.decodebytes(tx_result['tx'].encode('ascii'))
-    tx['index'] = tx_result['index']
-    tx['height'] = int(tx_result['height'])
-    for key, value in tx_msg['result']['events'].items():
-        if key == 'tx.hash':
-            tx['hash'] = value[0]
-            break
-    return TransferTx(**tx)
-
-
-def _search_result_to_tx(search_result) -> TransferTx:
-    tx = _events_to_dict(search_result['tx_result']['events'])
-    tx['raw'] = _b64_to_bytes(search_result['tx'])
-    tx['index'] = search_result['index']
-    tx['hash'] = search_result['hash']
-    tx['height'] = int(search_result['height'])
-    return TransferTx(**tx)
 
 
 def get_local_data_dir():
@@ -199,9 +181,15 @@ class ErcoinReactor:
         self._seen_tx_hashes: typing.Set[str] = set()
         self._catched_up = False
 
-    def _endpoint(self):
+    @functools.cached_property
+    def _ws_endpoint(self):
         protocol = 'wss' if self._ssl else 'ws'
         return f'{protocol}://{self._node}:{self._port}/websocket'
+
+    @functools.cached_property
+    def _http_endpoint(self):
+        protocol = "https" if self._ssl else "http"
+        return f"{protocol}://{self._node}:{self._port}"
 
     @functools.cached_property
     def _subscription_query(self):
@@ -298,22 +286,53 @@ class ErcoinReactor:
                 self._catched_up = int(msg['result']['total_count']) <= self._last_catchup_page * 100
                 if not self._catched_up:
                     catchup_id = await self._continue_catchup()
-                await self._handle_txs(_search_result_to_tx(res) for res in msg['result']['txs'])
+                await self._handle_txs(self._search_result_to_tx(res) for res in msg['result']['txs'])
                 if self._catched_up:
                     await self._handle_txs(self._tx_buf)
             elif msg_id == subscribe_id:
                 assert msg['result']['data']['type'] == 'tendermint/event/Tx'
-                await self._handle_tx(_subscription_msg_to_tx(msg))
+                await self._handle_tx(self._subscription_msg_to_tx(msg))
 
     async def start(self) -> typing.NoReturn:
         self._load_sync_status()
         while True:
             try:
-                async with websockets.connect(self._endpoint()) as ws:
+                async with websockets.connect(self._ws_endpoint) as ws:
                     await self._handle_connection(ws)
             except (websockets.exceptions.ConnectionClosedError, ConnectionError, TendermintServerError):
                 logger.warning(f'Connection error, sleeping {self.retry_timeout}s before retrying…')
                 await asyncio.sleep(self.retry_timeout)
+
+    @functools.lru_cache(maxsize=1)
+    def _fetch_block_time(self, height: int):
+        # It would be more efficient to reuse the WebSocket connection, but it would be more problematic in terms of caching and message ordering, so for now we just do a HTTP call.
+        url = f"{self._http_endpoint}/block?height={height}"
+        with urlopen(url) as f:
+            resp = json.load(f)
+            timestamp_str = resp["result"]["block"]["header"]["time"]
+            return dateutil.parser.isoparse(timestamp_str)
+
+    def _subscription_msg_to_tx(self, tx_msg) -> TransferTx:
+        tx_result = tx_msg['result']['data']['value']['TxResult']
+        tx = _events_to_dict(tx_result['result']['events'])
+        tx['raw'] = _b64_to_bytes(tx_result['tx'])
+        tx['index'] = tx_result['index']
+        tx['height'] = int(tx_result['height'])
+        tx['block_time'] = self._fetch_block_time(tx['height'])
+        for key, value in tx_msg['result']['events'].items():
+            if key == 'tx.hash':
+                tx['hash'] = value[0]
+                break
+        return TransferTx(**tx)
+
+    def _search_result_to_tx(self, search_result) -> TransferTx:
+        tx = _events_to_dict(search_result['tx_result']['events'])
+        tx['raw'] = _b64_to_bytes(search_result['tx'])
+        tx['index'] = search_result['index']
+        tx['hash'] = search_result['hash']
+        tx['height'] = int(search_result['height'])
+        tx['block_time'] = self._fetch_block_time(tx['height'])
+        return TransferTx(**tx)
 
     async def _handle_tx(self, tx: TransferTx):
         index = tx['index']

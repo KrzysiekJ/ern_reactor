@@ -6,7 +6,7 @@ with open('README.rst', 'r') as f:
 
 setup(
     name='ern_reactor',
-    version='0.2.1',
+    version='0.2.2',
     description='Do arbitrary things in reaction to Ercoin transfers',
     long_description=long_description,
     long_description_content_type='text/x-rst',
@@ -29,5 +29,8 @@ setup(
         'Topic :: Internet',
         'Topic :: Software Development :: Libraries :: Python Modules',
     ],
-    install_requires=['websockets>=8, <9'],
+    install_requires=[
+        'dateutil>=2, <3',
+        'websockets>=8, <9',
+    ],
 )
