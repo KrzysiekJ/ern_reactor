@@ -1,2 +1,2 @@
-dateutil>=2,<3
-websockets>=8,<9
+python-dateutil>=2,<3
+websockets>=9,<10
